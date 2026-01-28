@@ -1,0 +1,18 @@
+name: Scheduled Job
+
+on:
+  schedule:
+    # Run every hour at minute 0 (e.g., 00:00, 01:00, 02:00, etc.)
+    - cron: '0 * * * *'
+  workflow_dispatch:  # Allow manual trigger for testing
+
+jobs:
+  display-date:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    
+    steps:
+      - name: Display current date
+        run: |
+          echo "Current date: $(date '+%Y-%m-%d')"
