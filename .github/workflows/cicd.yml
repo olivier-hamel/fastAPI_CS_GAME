@@ -1,0 +1,139 @@
+name: CI/CD Pipeline
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      IMAGE:
+        description: 'Enable tagging (set to true to force tag creation)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+concurrency:
+  group: cicd-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  cicd:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: 1.8.0
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      - name: Cache Poetry dependencies
+        uses: actions/cache@v4
+        with:
+          path: fastapi-app/.venv
+          key: ${{ runner.os }}-poetry-${{ hashFiles('fastapi-app/poetry.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-poetry-
+
+      - name: Install dependencies
+        working-directory: ./fastapi-app
+        run: poetry install --no-interaction
+
+      - name: Run Black (code formatter check)
+        working-directory: ./fastapi-app
+        run: poetry run black --check .
+
+      - name: Run Ruff (linter)
+        working-directory: ./fastapi-app
+        run: poetry run ruff check .
+
+      - name: Run tests with coverage
+        working-directory: ./fastapi-app
+        run: poetry run pytest --cov=app --cov-report=term-missing --cov-report=xml
+
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v4
+        if: always()
+        with:
+          file: ./fastapi-app/coverage.xml
+          flags: unittests
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Build project with Poetry
+        working-directory: ./fastapi-app
+        run: poetry build
+
+      - name: Setup Node.js for semantic-release
+        if: github.base_ref == 'main' || github.ref == 'refs/heads/main' || github.event.inputs.IMAGE == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install semantic-release
+        if: github.base_ref == 'main' || github.ref == 'refs/heads/main' || github.event.inputs.IMAGE == 'true'
+        run: |
+          npm install -g semantic-release @semantic-release/git @semantic-release/changelog @semantic-release/commit-analyzer @semantic-release/release-notes-generator @semantic-release/github
+
+      - name: Create semantic release configuration
+        if: github.base_ref == 'main' || github.ref == 'refs/heads/main' || github.event.inputs.IMAGE == 'true'
+        run: |
+          cat > .releaserc.json <<EOF
+          {
+            "branches": ["main"],
+            "plugins": [
+              "@semantic-release/commit-analyzer",
+              "@semantic-release/release-notes-generator",
+              "@semantic-release/changelog",
+              [
+                "@semantic-release/git",
+                {
+                  "assets": ["CHANGELOG.md"],
+                  "message": "chore(release): \${nextRelease.version} [skip ci]\n\n\${nextRelease.notes}"
+                }
+              ],
+              "@semantic-release/github"
+            ]
+          }
+          EOF
+
+      - name: Generate and export SEM_VERSION
+        if: github.base_ref == 'main' || github.ref == 'refs/heads/main' || github.event.inputs.IMAGE == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEFAULT_VERSION: "0.1.0"
+        run: |
+          # For PRs, run semantic-release in dry-run mode to get the next version
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            echo "Running semantic-release in dry-run mode..."
+            OUTPUT=$(npx semantic-release --dry-run 2>&1 || true)
+            echo "$OUTPUT"
+            VERSION=$(echo "$OUTPUT" | grep -oE 'The next release version is [0-9]+\.[0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "$DEFAULT_VERSION")
+          else
+            # For manual runs, actually create the release
+            echo "Running semantic-release..."
+            npx semantic-release || true
+            VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "$DEFAULT_VERSION")
+          fi
+          echo "SEM_VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Semantic version determined: $VERSION"
+
+      - name: Display SEM_VERSION
+        if: github.base_ref == 'main' || github.ref == 'refs/heads/main' || github.event.inputs.IMAGE == 'true'
+        run: echo "SEM_VERSION is set to ${{ env.SEM_VERSION }}"
